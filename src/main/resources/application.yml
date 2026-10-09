@@ -1,0 +1,5 @@
+game:
+  host: 0.0.0.0
+  port: 7777
+  tick-ms: 50
+  state-broadcast-every-ticks: 5
