@@ -1,0 +1,60 @@
+### Mystery MMORPG REST examples
+### REST: http://localhost:8080
+### Netty TCP remains on localhost:7777
+
+### Ping
+GET http://localhost:8080/api/game/ping
+
+### Static map
+GET http://localhost:8080/api/game/map
+
+### Join
+POST http://localhost:8080/api/game/players
+Content-Type: application/json
+
+{
+  "name": "rest-player"
+}
+
+### Copy data.id from JOINED response here
+@playerId = 00000000-0000-0000-0000-000000000000
+
+### State
+GET http://localhost:8080/api/game/state
+
+### Move
+POST http://localhost:8080/api/game/players/{{playerId}}/move
+Content-Type: application/json
+
+{
+  "x": 52,
+  "y": 50
+}
+
+### Defend
+POST http://localhost:8080/api/game/players/{{playerId}}/defend
+
+### Dodge
+POST http://localhost:8080/api/game/players/{{playerId}}/dodge
+
+### Attack - replace targetId with a mob id from /state
+POST http://localhost:8080/api/game/players/{{playerId}}/attack
+Content-Type: application/json
+
+{
+  "targetId": "00000000-0000-0000-0000-000000000000",
+  "weapon": "SWORD"
+}
+
+### Generic endpoint: exact ClientMessage equivalent
+POST http://localhost:8080/api/game/command?playerId={{playerId}}
+Content-Type: application/json
+
+{
+  "type": "MOVE_TO",
+  "x": 53,
+  "y": 50
+}
+
+### Leave / REST equivalent of TCP disconnect
+DELETE http://localhost:8080/api/game/players/{{playerId}}

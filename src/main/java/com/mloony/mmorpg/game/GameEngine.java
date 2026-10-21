@@ -14,6 +14,7 @@ import org.springframework.stereotype.Component;
 
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 
 @Component
 public class GameEngine {
@@ -25,13 +26,13 @@ public class GameEngine {
     private final ObjectMapper mapper;
     private final GameProperties properties;
     private final BlockingQueue<GameCommandEnvelope> commands = new LinkedBlockingQueue<>();
-    
+
     private final ScheduledExecutorService gameLoop = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "game-loop");
         t.setDaemon(true);
         return t;
     });
-    
+
     private final Random random = new Random();
     private long tick;
 
@@ -54,15 +55,92 @@ public class GameEngine {
         gameLoop.shutdownNow();
     }
 
+    /**
+     * Добавление команд в очередь 
+     * Netty TCP
+     */
     public void submit(Channel channel, ClientMessage message) {
-        commands.offer(new GameCommandEnvelope(channel, message));
+        commands.offer(new GameCommandEnvelope(nettyContext(channel), message));
+    }
+
+    /**
+     * REST команды выполняются в той же очереди что и команды netty
+     */
+    public CompletableFuture<ServerMessage> submitRest(UUID playerId, ClientMessage message) {
+        CompletableFuture<ServerMessage> response = new CompletableFuture<>();
+        AtomicReference<UUID> playerRef = new AtomicReference<>(playerId);
+
+        GameCommandContext context = new GameCommandContext() {
+            @Override
+            public UUID playerId() {
+                return playerRef.get();
+            }
+
+            @Override
+            public void playerId(UUID id) {
+                playerRef.set(id);
+            }
+
+            @Override
+            public void reply(ServerMessage message) {
+                response.complete(message);
+            }
+        };
+
+        commands.offer(new GameCommandEnvelope(context, message));
+        return response;
+    }
+
+    public CompletableFuture<ServerMessage> disconnectRest(UUID playerId) {
+        if (playerId == null) {
+            return CompletableFuture.completedFuture(ServerMessage.error("playerId is required"));
+        }
+        return submitRest(playerId, new ClientMessage(null, "__DISCONNECT__", null, null, playerId, null));
     }
 
     public void disconnect(Channel channel) {
         UUID playerId = channel.attr(PLAYER_ID).getAndSet(null);
-        if (playerId != null)
-            commands.offer(new GameCommandEnvelope(channel,
-                    new ClientMessage(null, "__DISCONNECT__", null, null, playerId, null)));
+        if (playerId == null)
+            return;
+
+        GameCommandContext noReplyContext = new GameCommandContext() {
+            @Override
+            public UUID playerId() {
+                return playerId;
+            }
+
+            @Override
+            public void playerId(UUID id) {
+                // disconnected Netty session does not keep a player id
+            }
+
+            @Override
+            public void reply(ServerMessage message) {
+                // channel is already inactive; no reply is required
+            }
+        };
+
+        commands.offer(new GameCommandEnvelope(noReplyContext,
+                new ClientMessage(null, "__DISCONNECT__", null, null, playerId, null)));
+    }
+
+    private GameCommandContext nettyContext(Channel channel) {
+        return new GameCommandContext() {
+            @Override
+            public UUID playerId() {
+                return channel.attr(PLAYER_ID).get();
+            }
+
+            @Override
+            public void playerId(UUID playerId) {
+                channel.attr(PLAYER_ID).set(playerId);
+            }
+
+            @Override
+            public void reply(ServerMessage message) {
+                sendToChannel(channel, message);
+            }
+        };
     }
 
     private void safeTick() {
@@ -88,94 +166,103 @@ public class GameEngine {
 
     private void process(GameCommandEnvelope env) {
         ClientMessage msg = env.message();
-        Channel channel = env.channel();
+        GameCommandContext context = env.context();
 
         if ("__DISCONNECT__".equals(msg.name())) {
+            UUID playerId = msg.targetId() != null ? msg.targetId() : context.playerId();
+            if (playerId == null || gameWorld.player(playerId).isEmpty()) {
+                context.reply(ServerMessage.error("Player not found"));
+                return;
+            }
+
             gameWorld.removePlayer(msg.targetId());
+
+            context.playerId(null);
+            context.reply(ServerMessage.ok("LEFT", "Player left world", Map.of("playerId", playerId)));
             return;
         }
 
         if (msg.type() == null) {
-            send(channel, ServerMessage.error("type is required"));
+            context.reply(ServerMessage.error("type is required"));
             return;
         }
 
         switch (msg.type()) {
-        case JOIN -> join(channel, msg);
-        case MOVE_TO -> withPlayer(channel, p -> moveTo(channel, p, msg));
-        case ATTACK -> withPlayer(channel, p -> attack(channel, p, msg));
-        case DEFEND -> withPlayer(channel, p -> {
+        case JOIN -> join(context, msg);
+        case MOVE_TO -> withPlayer(context, p -> moveTo(context, p, msg));
+        case ATTACK -> withPlayer(context, p -> attack(context, p, msg));
+        case DEFEND -> withPlayer(context, p -> {
             p.defend(20); // ~1 sec with 50ms tick
-            send(channel, ServerMessage.ok("DEFEND", "Defense enabled", Map.of("ticks", 20)));
+            context.reply(ServerMessage.ok("DEFEND", "Defense enabled", Map.of("ticks", 20)));
         });
-        case DODGE -> withPlayer(channel, p -> {
+        case DODGE -> withPlayer(context, p -> {
             p.dodge(10); // ~0.5 sec
-            send(channel, ServerMessage.ok("DODGE", "Dodge stance enabled", Map.of("ticks", 10)));
+            context.reply(ServerMessage.ok("DODGE", "Dodge stance enabled", Map.of("ticks", 10)));
         });
-        case STATE -> send(channel, ServerMessage.ok("STATE", "World snapshot", snapshot()));
-        case PING -> send(channel, ServerMessage.ok("PONG", "pong", Map.of("tick", tick)));
+        case STATE -> context.reply(ServerMessage.ok("STATE", "World snapshot", snapshot()));
+        case PING -> context.reply(ServerMessage.ok("PONG", "pong", Map.of("tick", tick)));
         }
     }
 
-    private void join(Channel channel, ClientMessage msg) {
-        if (channel.attr(PLAYER_ID).get() != null) {
-            send(channel, ServerMessage.error("Already joined"));
+    private void join(GameCommandContext context, ClientMessage msg) {
+        if (context.playerId() != null) {
+            context.reply(ServerMessage.error("Already joined"));
             return;
         }
         String name = msg.name() == null || msg.name().isBlank() ? "player" : msg.name().trim();
         Player p = gameWorld.addPlayer(name);
-        channel.attr(PLAYER_ID).set(p.getId());
-        send(channel, ServerMessage.ok("JOINED", "Joined world", playerView(p)));
+        context.playerId(p.getId());
+        context.reply(ServerMessage.ok("JOINED", "Joined world", playerView(p)));
     }
 
-    private void moveTo(Channel channel, Player player, ClientMessage msg) {
+    private void moveTo(GameCommandContext context, Player player, ClientMessage msg) {
         if (msg.x() == null || msg.y() == null) {
-            send(channel, ServerMessage.error("MOVE_TO requires x and y"));
+            context.reply(ServerMessage.error("MOVE_TO requires x and y"));
             return;
         }
         Position target = new Position(msg.x(), msg.y());
         Deque<Position> path = pathFinder.find(gameWorld, player.getId(), player.getPosition(), target);
         if (path.isEmpty() && !player.getPosition().equals(target)) {
-            send(channel, ServerMessage.error("No path to target"));
+            context.reply(ServerMessage.error("No path to target"));
             return;
         }
         player.setPath(path);
-        send(channel,
+        context.reply(
                 ServerMessage.ok("PATH_ACCEPTED", "Movement started", Map.of("steps", path.size(), "target", target)));
     }
 
-    private void attack(Channel channel, Player player, ClientMessage msg) {
+    private void attack(GameCommandContext context, Player player, ClientMessage msg) {
         if (msg.targetId() == null || msg.weapon() == null) {
-            send(channel, ServerMessage.error("ATTACK requires targetId and weapon"));
+            context.reply(ServerMessage.error("ATTACK requires targetId and weapon"));
             return;
         }
         Mob mob = gameWorld.mob(msg.targetId()).orElse(null);
         if (mob == null || !mob.isAlive()) {
-            send(channel, ServerMessage.error("Target mob not found/alive"));
+            context.reply(ServerMessage.error("Target mob not found/alive"));
             return;
         }
 
         WeaponType weapon = msg.weapon();
         int distance = player.getPosition().manhattanDistance(mob.getPosition());
         if (distance > weapon.range()) {
-            send(channel, ServerMessage.error("Target out of range"));
+            context.reply(ServerMessage.error("Target out of range"));
             return;
         }
         if (weapon == WeaponType.BOW && gameWorld.projectileBlocked(player.getPosition(), mob.getPosition())) {
-            send(channel, ServerMessage.error("Projectile path is blocked"));
+            context.reply(ServerMessage.error("Projectile path is blocked"));
             return;
         }
         if (random.nextDouble() > weapon.accuracy()) {
-            send(channel, ServerMessage.ok("ATTACK_RESULT", "Miss", Map.of("targetId", mob.getId())));
+            context.reply(ServerMessage.ok("ATTACK_RESULT", "Miss", Map.of("targetId", mob.getId())));
             return;
         }
         if (random.nextDouble() < mob.getType().dodgeChance()) {
-            send(channel, ServerMessage.ok("ATTACK_RESULT", "Mob dodged", Map.of("targetId", mob.getId())));
+            context.reply(ServerMessage.ok("ATTACK_RESULT", "Mob dodged", Map.of("targetId", mob.getId())));
             return;
         }
 
         mob.damage(weapon.damage());
-        send(channel, ServerMessage.ok("ATTACK_RESULT", mob.isAlive() ? "Hit" : "Mob killed",
+        context.reply(ServerMessage.ok("ATTACK_RESULT", mob.isAlive() ? "Hit" : "Mob killed",
                 Map.of("targetId", mob.getId(), "damage", weapon.damage(), "mobHp", mob.getHp())));
     }
 
@@ -244,15 +331,15 @@ public class GameEngine {
         }
     }
 
-    private void withPlayer(Channel channel, java.util.function.Consumer<Player> action) {
-        UUID id = channel.attr(PLAYER_ID).get();
+    private void withPlayer(GameCommandContext context, java.util.function.Consumer<Player> action) {
+        UUID id = context.playerId();
         if (id == null) {
-            send(channel, ServerMessage.error("JOIN first"));
+            context.reply(ServerMessage.error("JOIN first"));
             return;
         }
         Player p = gameWorld.player(id).orElse(null);
         if (p == null) {
-            send(channel, ServerMessage.error("Player not found"));
+            context.reply(ServerMessage.error("Player not found"));
             return;
         }
         action.accept(p);
@@ -281,7 +368,7 @@ public class GameEngine {
         connections.channels().writeAndFlush(json + "\n");
     }
 
-    private void send(Channel channel, ServerMessage message) {
+    private void sendToChannel(Channel channel, ServerMessage message) {
         channel.writeAndFlush(toJson(message) + "\n");
     }
 
