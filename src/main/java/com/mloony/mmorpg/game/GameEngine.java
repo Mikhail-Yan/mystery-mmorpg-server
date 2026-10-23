@@ -10,6 +10,8 @@ import io.netty.channel.Channel;
 import io.netty.util.AttributeKey;
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
@@ -18,6 +20,8 @@ import java.util.concurrent.atomic.AtomicReference;
 
 @Component
 public class GameEngine {
+    private static final Logger log = LoggerFactory.getLogger(GameEngine.class);
+
     public static final AttributeKey<UUID> PLAYER_ID = AttributeKey.valueOf("playerId");
 
     private final GameWorld gameWorld;
@@ -47,19 +51,23 @@ public class GameEngine {
 
     @PostConstruct
     void start() {
+        log.info("Starting game loop tickMs={} stateBroadcastEveryTicks={}", properties.tickMs(),
+                properties.stateBroadcastEveryTicks());
         gameLoop.scheduleAtFixedRate(this::safeTick, 0, properties.tickMs(), TimeUnit.MILLISECONDS);
     }
 
     @PreDestroy
     void stop() {
+        log.info("Stopping game loop tick={}", tick);
         gameLoop.shutdownNow();
     }
 
     /**
-     * Добавление команд в очередь 
-     * Netty TCP
+     * Добавление команд в очередь Netty TCP
      */
     public void submit(Channel channel, ClientMessage message) {
+        log.debug("Enqueue TCP command channel={} playerId={} type={}", channel.id().asShortText(),
+                channel.attr(PLAYER_ID).get(), message.type());
         commands.offer(new GameCommandEnvelope(nettyContext(channel), message));
     }
 
@@ -87,6 +95,7 @@ public class GameEngine {
             }
         };
 
+        log.debug("Enqueue REST command playerId={} type={}", playerId, message.type());
         commands.offer(new GameCommandEnvelope(context, message));
         return response;
     }
@@ -120,6 +129,7 @@ public class GameEngine {
             }
         };
 
+        log.debug("Enqueue TCP disconnect playerId={}", playerId);
         commands.offer(new GameCommandEnvelope(noReplyContext,
                 new ClientMessage(null, "__DISCONNECT__", null, null, playerId, null)));
     }
@@ -147,7 +157,7 @@ public class GameEngine {
         try {
             tick();
         } catch (Exception e) {
-            e.printStackTrace();
+            log.error("Unhandled game-loop error tick={} queueSize={}", tick, commands.size(), e);
         }
     }
 
@@ -167,6 +177,8 @@ public class GameEngine {
     private void process(GameCommandEnvelope env) {
         ClientMessage msg = env.message();
         GameCommandContext context = env.context();
+        log.debug("Process command tick={} playerId={} type={} internalName={}", tick, context.playerId(), msg.type(),
+                msg.name());
 
         if ("__DISCONNECT__".equals(msg.name())) {
             UUID playerId = msg.targetId() != null ? msg.targetId() : context.playerId();
@@ -176,6 +188,7 @@ public class GameEngine {
             }
 
             gameWorld.removePlayer(msg.targetId());
+            log.info("Player left world playerId={} tick={}", playerId, tick);
 
             context.playerId(null);
             context.reply(ServerMessage.ok("LEFT", "Player left world", Map.of("playerId", playerId)));
@@ -211,6 +224,8 @@ public class GameEngine {
         }
         String name = msg.name() == null || msg.name().isBlank() ? "player" : msg.name().trim();
         Player p = gameWorld.addPlayer(name);
+        log.info("Player joined playerId={} name={} position={}", p.getId(), p.getName(), p.getPosition());
+
         context.playerId(p.getId());
         context.reply(ServerMessage.ok("JOINED", "Joined world", playerView(p)));
     }
@@ -227,6 +242,8 @@ public class GameEngine {
             return;
         }
         player.setPath(path);
+        log.debug("Path accepted playerId={} from={} target={} steps={}", player.getId(), player.getPosition(), target,
+                path.size());
         context.reply(
                 ServerMessage.ok("PATH_ACCEPTED", "Movement started", Map.of("steps", path.size(), "target", target)));
     }
@@ -262,6 +279,12 @@ public class GameEngine {
         }
 
         mob.damage(weapon.damage());
+        log.debug("Player attack playerId={} targetId={} weapon={} damage={} mobHp={}", player.getId(), mob.getId(),
+                weapon, weapon.damage(), mob.getHp());
+        if (!mob.isAlive()) {
+            log.info("Mob killed playerId={} mobId={} mobType={} tick={}", player.getId(), mob.getId(), mob.getType(),
+                    tick);
+        }
         context.reply(ServerMessage.ok("ATTACK_RESULT", mob.isAlive() ? "Hit" : "Mob killed",
                 Map.of("targetId", mob.getId(), "damage", weapon.damage(), "mobHp", mob.getHp())));
     }
@@ -309,7 +332,11 @@ public class GameEngine {
         if (player.isDefending())
             damage = Math.max(1, damage / 2);
         player.damage(damage);
+        log.trace("Mob attack mobId={} playerId={} damage={} playerHp={}", mob.getId(), player.getId(), damage,
+                player.getHp());
         if (!player.isAlive()) {
+            log.info("Player died playerId={} killedByMobId={} mobType={} tick={}", player.getId(), mob.getId(),
+                    mob.getType(), tick);
             player.setPath(new ArrayDeque<>());
         }
     }
@@ -365,6 +392,9 @@ public class GameEngine {
     private void broadcastState() {
         ServerMessage state = ServerMessage.ok("STATE", "World snapshot", snapshot());
         String json = toJson(state);
+
+        log.trace("Broadcast STATE tick={} players={} mobs={} connections={}", tick, gameWorld.players().size(),
+                gameWorld.mobs().size(), connections.channels().size());
         connections.channels().writeAndFlush(json + "\n");
     }
 
@@ -376,6 +406,7 @@ public class GameEngine {
         try {
             return mapper.writeValueAsString(value);
         } catch (Exception e) {
+            log.error("Cannot encode JSON valueType={}", value == null ? "null" : value.getClass().getName(), e);
             throw new IllegalStateException("Cannot encode JSON", e);
         }
     }

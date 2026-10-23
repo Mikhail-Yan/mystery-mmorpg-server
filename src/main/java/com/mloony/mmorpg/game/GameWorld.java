@@ -2,12 +2,21 @@ package com.mloony.mmorpg.game;
 
 import org.springframework.stereotype.Component;
 
-import com.mloony.mmorpg.game.model.*;
+import com.mloony.mmorpg.game.model.Mob;
+import com.mloony.mmorpg.game.model.MobType;
+import com.mloony.mmorpg.game.model.Obstacle;
+import com.mloony.mmorpg.game.model.ObstacleType;
+import com.mloony.mmorpg.game.model.Player;
+import com.mloony.mmorpg.game.model.Position;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import java.util.*;
 
 @Component
 public class GameWorld {
+    private static final Logger log = LoggerFactory.getLogger(GameWorld.class);
+
     public static final int WIDTH = 100;
     public static final int HEIGHT = 100;
 
